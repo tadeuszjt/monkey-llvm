@@ -30,15 +30,36 @@ makeBlock :: [LL.Named LL.Instruction] -> LL.Named LL.Terminator -> LL.BasicBloc
 makeBlock = LL.BasicBlock (LL.UnName 1) 
 
 
--- Cmp state
-data FnState
-	= FnState
-		{ unCount :: Word
-		, symTab  :: SymTab.SymTab Name LL.Operand
+type Names = Map.Map Name Int
+
+
+uniqueName :: Name -> Names -> (Name, Names)
+uniqueName name names =
+	case Map.lookup name names of
+		Just x  -> (name ++ show x, Map.insert name (x+1) names)
+		Nothing -> (name, Map.insert name 1 names)
+
+
+data BlockState
+	= BlockState
+		{ idx   :: Int
+		, stack :: [LL.Named LL.Instruction]
+		, term  :: Maybe (LL.Named LL.Terminator)
 		}
 	deriving (Show)
 
 
+data FnState
+	= FnState
+		{ unCount  :: Word
+		, symTab   :: SymTab.SymTab Name LL.Operand
+		, curBlock :: Name
+		, blocks   :: Map.Map Name BlockState
+		}
+	deriving (Show)
+
+
+-- Cmp state
 data CmpState
 	= CmpState
 		{ llModule  :: LL.Module
@@ -53,8 +74,13 @@ newtype Cmp a
 	deriving (Functor, Applicative, Monad, MonadState CmpState)
 
 
-initFnState = FnState 0 SymTab.initSymTab [] Nothing
-initCmpState = CmpState LL.defaultModule (Map.singleton "main" initFnState)
+initBlockState = BlockState 0 [] Nothing
+initFnState = FnState 0 SymTab.initSymTab "entry" (Map.singleton "entry" initBlockState)
+initCmpState = CmpState LL.defaultModule Map.empty ""
+
+
+cmpAST :: AST -> Cmp ()
+cmpAST = mapM_ stmt 
 
 
 addDef :: LL.Definition -> Cmp ()
@@ -74,51 +100,64 @@ defFunc retType label argTypes body = addDef $
 		}
 
 
+getCurFn :: Cmp FnState
+getCurFn = do
+	name <- gets currentFn
+	fns <- gets functions
+	return $ (Map.!) fns name
+
+
+putCurFn :: FnState -> Cmp ()
+putCurFn f = do
+	name <- gets currentFn 
+	modify $ \s -> s { functions = Map.insert name f (functions s) }
+
+
+getCurBlock :: Cmp BlockState
+getCurBlock = do
+	fn <- getCurFn
+	return $ (Map.!) (blocks fn) (curBlock fn)
+
+
+putCurBlock :: BlockState -> Cmp ()
+putCurBlock block = do
+	fn <- getCurFn
+	putCurFn $ fn { blocks = Map.insert (curBlock fn) block (blocks fn) }
+
+
 unique :: Cmp LL.Name
 unique = do
-	fnState:fs <- gets functions
-	let count = unCount fnState
-
-	modify $ \s -> s { functions = (fnState { unCount = count + 1 }):fs }
+	fn <- getCurFn 
+	let count = unCount fn
+	putCurFn $ fn { unCount = count + 1 }
 	return $ LL.UnName count
 
 
-emit :: LL.Named LL.Instruction -> Cmp ()
-emit ins = do
-	fnState:fs <- gets functions
-	let fnState' = fnState { stack = (stack fnState) ++ [ins] }
-	modify $ \s -> s { functions = fnState':fs }
+instr :: LL.Instruction -> Cmp LL.Operand
+instr ins = do
+	ref <- unique
+	blk <- getCurBlock
+	putCurBlock $ blk { stack = (ref LL.:= ins) : (stack blk) }
+	return $ LL.LocalReference LL.i32 ref
 
 
-lookup :: Name -> Cmp LL.Operand
-lookup name = do
-	fnState:fs <- gets functions
-	case SymTab.lookup name (symTab fnState) of
-		Just x  -> return x
-		Nothing -> error $ name ++ " not found"
+lookupName :: Name -> Cmp (Maybe LL.Operand)
+lookupName name = fmap (SymTab.lookup name) (fmap symTab getCurFn)
 
 
-assign :: Name -> LL.Operand -> Cmp ()
-assign name typ op = do
-	fnState:fs <- gets functions
-	case SymTab.lookup name (symTab fnState) of
-		Just _  -> error $ name ++ " already defined" 
+stmt :: Stmt -> Cmp ()
+stmt (Assign _ name e) = do
+	l <- lookupName name
+	case l of
+		Just n  -> error $ name ++ " already defined"
 		Nothing -> return ()
 
-	let fnState' = fnState { symTab = SymTab.insert name op (symTab fnState) }
-	modify $ \s -> s { functions = fnState':fs } 
+	val <- expr e
+	ptr <- instr $ LL.Alloca LL.i32 Nothing 0 []
+	instr $ LL.Store False ptr val Nothing 0 []
+	return ()
 
 
-pushScope :: Cmp ()
-pushScope = do
-	fnState:fs <- gets functions
-	let fnState' = fnState { symTab = SymTab.push (symTab fnState) }
-	modify $ \s -> s { functions = fnState':fs }
-
-		
-popScope :: Cmp ()
-popScope = do
-	fnState:fs <- gets functions
-	let fnState' = fnState { symTab = SymTab.pop (symTab fnState) }
-	modify $ \s -> s { functions = fnState':fs }
-
+expr :: Expr -> Cmp LL.Operand
+expr (S.Int pos n) =
+	return $ LL.ConstantOperand (LL.Int 32 $ toInteger n)
