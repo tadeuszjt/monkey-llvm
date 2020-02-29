@@ -15,7 +15,6 @@ import qualified LLVM.AST.Type as LL
 import qualified LLVM.AST.Global as LL
 import qualified LLVM.AST.Name as LL
 import qualified LLVM.AST.Instruction as LL
-import qualified LLVM.AST.Operand as LLOp
 import qualified LLVM.AST.Constant as LL
 
 import Lexer as L
@@ -54,6 +53,7 @@ data FnState
 		, symTab   :: SymTab.SymTab Name LL.Operand
 		, curBlock :: Name
 		, blocks   :: Map.Map Name BlockState
+		, names    :: Names
 		}
 	deriving (Show)
 
@@ -74,7 +74,7 @@ newtype Cmp a
 
 
 initBlockState = BlockState 0 [] Nothing
-initFnState = FnState 0 SymTab.initSymTab "entry" (Map.singleton "entry" initBlockState)
+initFnState = FnState 0 SymTab.initSymTab "entry" (Map.singleton "entry" initBlockState) Map.empty
 initCmpState = CmpState LL.defaultModule (Map.singleton "main" initFnState) "main"
 
 
@@ -135,6 +135,18 @@ putCurBlock block = do
 	putCurFn $ fn { blocks = Map.insert (curBlock fn) block (blocks fn) }
 
 
+pushScope :: Cmp ()
+pushScope = do
+	fn <- getCurFn
+	putCurFn $ fn { symTab = SymTab.push (symTab fn) }
+
+
+popScope :: Cmp ()
+popScope = do
+	fn <- getCurFn
+	putCurFn $ fn { symTab = SymTab.pop (symTab fn) }
+
+
 unique :: Cmp LL.Name
 unique = do
 	fn <- getCurFn 
@@ -143,18 +155,24 @@ unique = do
 	return $ LL.UnName count
 
 
-doInstr :: LL.Instruction -> Cmp ()
-doInstr ins = do
-	blk <- getCurBlock
-	void $ putCurBlock $ blk { stack = (LL.Do ins) : (stack blk) }
-
-
 instr :: LL.Instruction -> Cmp LL.Operand
 instr ins = do
 	ref <- unique
 	blk <- getCurBlock
 	putCurBlock $ blk { stack = (ref LL.:= ins) : (stack blk) }
 	return $ LL.LocalReference LL.i32 ref
+
+
+refInstr :: LL.Name -> LL.Instruction -> Cmp ()
+refInstr ref ins = do
+	blk <- getCurBlock
+	putCurBlock $ blk { stack = (ref LL.:= ins) : (stack blk) }
+
+
+doInstr :: LL.Instruction -> Cmp ()
+doInstr ins = do
+	blk <- getCurBlock
+	putCurBlock $ blk { stack = (LL.Do ins) : (stack blk) }
 
 
 terminator :: LL.Named LL.Terminator -> Cmp ()
@@ -169,22 +187,25 @@ lookupName name = fmap (SymTab.lookup name) (fmap symTab getCurFn)
 
 stmt :: Stmt -> Cmp ()
 stmt (Assign _ name e) = do
-	l <- lookupName name
-	case l of
+	fn <- getCurFn
+	case SymTab.lookup name [head $ symTab fn] of
 		Just n  -> error $ name ++ " already defined"
 		Nothing -> return ()
 
-	fn <- getCurFn
-	let op = LL.LocalReference LL.i32 (LL.mkName name)
-	putCurFn $ fn { symTab = SymTab.insert name op (symTab fn) }
+	let (unName, names') = uniqueName name (names fn)
+	let ref = LL.mkName unName
+	let loc = local i32 ref
 
-	val <- expr e
-	blk <- getCurBlock
-	let ref = LL.mkName name
-	let ins = LL.Alloca LL.i32 Nothing 0 []
-	let ptr = LL.LocalReference LL.i32 ref 
-	putCurBlock $ blk { stack = (ref LL.:= ins) : (stack blk) }
-	doInstr $ LL.Store False ptr val Nothing 0 []
+	putCurFn $ fn
+		{ symTab = SymTab.insert name loc (symTab fn)
+		, names  = names'
+		}
+
+	alloca ref i32
+	store loc =<< expr e
+		
+stmt (Block stmts) =
+	pushScope >> mapM_ stmt stmts >> pushScope
 
 
 expr :: Expr -> Cmp LL.Operand
@@ -196,3 +217,20 @@ expr (S.Ident pos name) = do
 	case l of
 		Just op -> return op
 		Nothing -> error $ name ++ " does not exist"
+
+
+-- LL Instruction wrappers
+i32 :: LL.Type
+i32 = LL.i32
+
+
+local :: LL.Type -> LL.Name -> LL.Operand
+local typ ref = LL.LocalReference typ ref
+
+
+alloca :: LL.Name -> LL.Type -> Cmp ()
+alloca ref typ = refInstr ref $ LL.Alloca typ Nothing 0 []
+
+
+store :: LL.Operand -> LL.Operand -> Cmp ()
+store ptr val = doInstr $ LL.Store False ptr val Nothing 0 []
