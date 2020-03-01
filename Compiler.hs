@@ -134,10 +134,12 @@ getCurFn = do
 	return $ (Map.!) fns name
 
 
-putCurFn :: FnState -> Cmp ()
-putCurFn f = do
-	name <- gets currentFn 
-	modify $ \s -> s { functions = Map.insert name f (functions s) }
+modifyCurFn :: (FnState -> FnState) -> Cmp ()
+modifyCurFn f = do
+	name <- gets currentFn
+	fns <- gets functions
+	let fn = (Map.!) fns name
+	modify $ \s -> s { functions = Map.insert name (f fn) (functions s) }
 
 
 getCurBlock :: Cmp BlockState
@@ -147,28 +149,15 @@ getCurBlock = do
 
 
 putCurBlock :: BlockState -> Cmp ()
-putCurBlock block = do
-	fn <- getCurFn
-	putCurFn $ fn { blocks = Map.insert (curBlock fn) block (blocks fn) }
-
-
-pushScope :: Cmp ()
-pushScope = do
-	fn <- getCurFn
-	putCurFn $ fn { symTab = SymTab.push (symTab fn) }
-
-
-popScope :: Cmp ()
-popScope = do
-	fn <- getCurFn
-	putCurFn $ fn { symTab = SymTab.pop (symTab fn) }
+putCurBlock block =
+	modifyCurFn $ \fn -> fn { blocks = Map.insert (curBlock fn) block (blocks fn) }
 
 
 unique :: Cmp LL.Name
 unique = do
 	fn <- getCurFn 
 	let count = unCount fn
-	putCurFn $ fn { unCount = count + 1 }
+	modifyCurFn $ \fn -> fn { unCount = count + 1 }
 	return $ LL.UnName count
 
 
@@ -195,7 +184,7 @@ stmt (Assign _ name e) = do
 	let ref = LL.mkName unName
 	let loc = local i32 ref
 
-	putCurFn $ fn
+	modifyCurFn $ \fn -> fn
 		{ symTab = SymTab.insert name loc (symTab fn)
 		, names  = names'
 		}
@@ -209,8 +198,10 @@ stmt (Set _ name e) = do
 		Just loc -> store loc =<< expr e
 		Nothing  -> error $ name ++ " doesn't exist"
 
-stmt (Block stmts) =
-	pushScope >> mapM_ stmt stmts >> pushScope
+stmt (Block stmts) = do
+	modifyCurFn $ \fn -> fn { symTab = SymTab.push (symTab fn) }
+	mapM_ stmt stmts
+	modifyCurFn $ \fn -> fn { symTab = SymTab.pop (symTab fn) }
 
 stmt (S.Set _ name e) = do
 	l <- lookupName name
