@@ -1,7 +1,3 @@
-let x = 0;
+let x = 4;
 let y = x;
-
-{
-	let x = 12;
-	y = 243;
-}
+print(x);

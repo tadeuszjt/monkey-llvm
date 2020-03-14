@@ -7,6 +7,7 @@ import qualified Lexer as L
 import qualified Parser as P
 import qualified AST as S
 import qualified Compiler as C
+import LLVMWrap
 
 import LLVM.AST as VS
 import LLVM.Module as V
@@ -28,8 +29,7 @@ main = do
 
 	let tokens = L.alexScanTokens content
 	let ast = P.parseTokens tokens
-	let mod = C.compileAST ast 
-
+	let mod = cmpToModule (C.compileAST ast)
 	putLLVMModule mod
 
 	hClose handle

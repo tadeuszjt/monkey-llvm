@@ -5,6 +5,7 @@ module Compiler where
 import Data.Function
 import Data.List
 import Data.Either
+import Data.Char
 import qualified Data.Map as Map
 import Control.Monad.State
 import qualified Data.ByteString.Char8 as BS
@@ -15,7 +16,7 @@ import qualified LLVM.AST.Type as LL
 import qualified LLVM.AST.Global as LL
 import qualified LLVM.AST.Name as LL
 import qualified LLVM.AST.Instruction as LL
-import qualified LLVM.AST.Constant as LL
+import qualified LLVM.AST.Constant as LLC
 import qualified LLVM.AST.Linkage as LL
 import qualified LLVM.AST.AddrSpace as LL
 import qualified LLVM.AST.AddrSpace as LL
@@ -26,14 +27,17 @@ import AST as S
 import qualified SymTab 
 
 
-compileAST :: AST -> LL.Module
+local = LL.LocalReference 
+global = LLC.GlobalReference
+cons = LL.ConstantOperand
+
+
+compileAST :: AST -> CmpState
 compileAST ast =
-	let state = execState (getCmp $ cmpAST ast) initCmpState
-	in llModule state
+	execState (getCmp $ cmpAST ast) initCmpState
 
 
 type Names = Map.Map Name Int
-
 
 uniqueName :: Name -> Names -> (Name, Names)
 uniqueName name names =
@@ -53,11 +57,12 @@ data BlockState
 
 data FnState
 	= FnState
-		{ unCount  :: Word
-		, symTab   :: SymTab.SymTab Name LL.Operand
-		, curBlock :: Name
-		, blocks   :: Map.Map Name BlockState
-		, names    :: Names
+		{ unCount   :: Word
+		, symTab    :: SymTab.SymTab Name LL.Operand
+		, curBlock  :: LL.Name
+		, blocks    :: Map.Map LL.Name BlockState
+		, names     :: Names
+		, constants :: Map.Map LL.Name LLC.Constant
 		}
 	deriving (Show)
 
@@ -65,9 +70,8 @@ data FnState
 -- Cmp state
 data CmpState
 	= CmpState
-		{ llModule  :: LL.Module
-		, functions :: Map.Map LL.Name FnState
-		, currentFn :: LL.Name
+		{ funcs :: Map.Map LL.Name FnState
+		, curFn :: LL.Name
 		}
 	deriving (Show)
 
@@ -78,206 +82,183 @@ newtype Cmp a
 
 
 initBlockState = BlockState 0 [] Nothing
-initFnState = FnState 0 SymTab.initSymTab "entry" (Map.singleton "entry" initBlockState) Map.empty
-initCmpState = CmpState LL.defaultModule (Map.singleton (LL.mkName "main") initFnState) (LL.mkName "main")
+
+
+initFnState = FnState
+	{ unCount   = 0
+	, symTab    = SymTab.initSymTab
+	, curBlock  = LL.mkName "entry"
+	, blocks    = Map.singleton (LL.mkName "entry") initBlockState
+	, names     = Map.singleton "entry" 0
+	, constants = Map.empty
+	}
+
+
+initCmpState = CmpState
+	{ funcs = Map.singleton (LL.mkName "main") initFnState
+	, curFn = LL.mkName "main"
+	}
 
 
 cmpAST :: AST -> Cmp ()
 cmpAST ast = do
+	setTerminator $ LL.Do $ LL.Ret Nothing []
 	mapM_ stmt ast
-
-	fn <- getCurFn
-	let blks = blocks fn
-	let sortedBlocks = sortBy (compare `on` (idx . snd)) (Map.toList blks)
-	ref <- unique
-	terminator $ (ref LL.:= LL.Ret Nothing [])
-
-	defExtFunc LL.i32 "puts" [(LL.PointerType LL.i8 (LL.AddrSpace 0), LL.mkName "str")]
-	defFunc LL.void "main" [] (map makeBlock sortedBlocks)
-	where
-		makeBlock :: (Name, BlockState) -> LL.BasicBlock
-		makeBlock (name, blk) = LL.BasicBlock (LL.mkName name) (reverse $ stack blk) (LL.Do $ LL.Ret Nothing [])
+	--puts "benis"
+	return ()
 
 
-addDef :: LL.Definition -> Cmp ()
-addDef def = do
-	llMod <- gets llModule
-	let defs = LL.moduleDefinitions llMod
-	modify $ \s -> s { llModule = llMod { LL.moduleDefinitions = defs ++ [def] } }
-
-
-defFunc :: LL.Type -> String -> [(LL.Type, LL.Name)] -> [LL.BasicBlock] -> Cmp ()
-defFunc retType label argTypes body = addDef $ 
-	LL.GlobalDefinition $ LL.functionDefaults
-		{ LL.name        = LL.mkName label
-		, LL.parameters  = (map (\(ty, nm) -> LL.Parameter ty nm [])  argTypes, False)
-		, LL.returnType  = retType
-		, LL.basicBlocks = body
-		}
-
-
-defExtFunc :: LL.Type -> Name -> [(LL.Type, LL.Name)] -> Cmp ()
-defExtFunc retType label argTypes = addDef $
-	LL.GlobalDefinition $ LL.functionDefaults
-		{ LL.name        = LL.mkName label
-		, LL.linkage     = LL.External
-		, LL.parameters  = (map (\(ty, nm) -> LL.Parameter ty nm [])  argTypes, False)
-		, LL.returnType  = retType
-		, LL.basicBlocks = []
-		}
-
-
+-- Functions
 getCurFn :: Cmp FnState
 getCurFn = do
-	name <- gets currentFn
-	fns <- gets functions
-	return $ (Map.!) fns name
+	name <- gets curFn
+	fns <- gets funcs
+	return $ (Map.!) fns name 
 
 
 modifyCurFn :: (FnState -> FnState) -> Cmp ()
 modifyCurFn f = do
-	name <- gets currentFn
-	fns <- gets functions
-	let fn = (Map.!) fns name
-	modify $ \s -> s { functions = Map.insert name (f fn) (functions s) }
+	name <- gets curFn
+	fns <- gets funcs
+	let fn = (Map.!) fns name 
+	modify $ \s -> s { funcs = Map.insert name (f fn) (funcs s) }
 
 
-getCurBlock :: Cmp BlockState
-getCurBlock = do
+addConstant :: Name -> LLC.Constant -> Cmp LL.Name
+addConstant name cons = do
+	LL.Name curFnName <- gets curFn
 	fn <- getCurFn
-	return $ (Map.!) (blocks fn) (curBlock fn)
+
+	let (name', names') = uniqueName name (names fn)
+	let consName = LL.mkName $ (BS.unpack $ BSS.fromShort curFnName) ++ "." ++ name'
+
+	modifyCurFn $ \f -> f { constants = Map.insert consName cons (constants f), names = names' }
+	return consName
 
 
-putCurBlock :: BlockState -> Cmp ()
-putCurBlock block =
-	modifyCurFn $ \fn -> fn { blocks = Map.insert (curBlock fn) block (blocks fn) }
+-- Blocks
+modifyCurBlock :: (BlockState -> BlockState) -> Cmp ()
+modifyCurBlock f = do
+	fn <- getCurFn
+	let blks = blocks fn
+	let curBlk = (Map.!) blks (curBlock fn)
+	modifyCurFn $ \fn -> fn { blocks = Map.insert (curBlock fn) (f curBlk) blks }
+	
+
+setTerminator :: LL.Named LL.Terminator -> Cmp ()
+setTerminator term =
+	modifyCurBlock $ \b -> b { term = Just term }
+
+
+-- Names
+unName :: Name -> Cmp Name
+unName name = do
+	fn <- getCurFn
+	let (name', names') = uniqueName name (names fn)
+	modifyCurFn $ \fn -> fn { names = names'}
+	return name'
+
+
+lookupName :: Name -> Cmp (Maybe LL.Operand)
+lookupName name = do
+	fn <- getCurFn
+	return $ SymTab.lookup name (symTab fn)
 
 
 unique :: Cmp LL.Name
 unique = do
-	fn <- getCurFn 
-	let count = unCount fn
-	modifyCurFn $ \fn -> fn { unCount = count + 1 }
+	fn <- getCurFn
+	let count = (unCount fn) + 1
+	modifyCurFn $ \fn -> fn { unCount = count }
 	return $ LL.UnName count
 
 
+-- Instructions
+instr :: LL.Named LL.Instruction -> Cmp ()
+instr ins =
+	modifyCurBlock $ \b -> b { stack = ins : (stack b) }
 
-terminator :: LL.Named LL.Terminator -> Cmp ()
-terminator term = do
-	blk <- getCurBlock
-	putCurBlock $ blk { term = Just term }
 
-
-lookupName :: Name -> Cmp (Maybe LL.Operand)
-lookupName name = fmap (SymTab.lookup name) (fmap symTab getCurFn)
-
+typeOf :: LL.Operand -> LL.Type
+typeOf (LL.ConstantOperand (LLC.Int 32 _))  = LL.i32
+typeOf (LL.ConstantOperand (LLC.Array t a)) = LL.ArrayType (fromIntegral $ length a) t
+typeOf (LL.LocalReference t _)              = t
 
 
 stmt :: Stmt -> Cmp ()
-stmt (Assign _ name e) = do
-	fn <- getCurFn
-	case SymTab.lookup name [head $ symTab fn] of
-		Just n  -> error $ name ++ " already defined"
-		Nothing -> return ()
+stmt s = case s of
+	(Assign pos name ex) -> do
+		fn <- getCurFn
+		case SymTab.lookup name [(head $ symTab fn)] of
+			Just _  -> error $ name ++ " already defined"
+			Nothing -> return ()
 
-	let (unName, names') = uniqueName name (names fn)
-	let ref = LL.mkName unName
-	let loc = local i32 ref
+		val <- expr ex
+		let typ = typeOf val
 
-	modifyCurFn $ \fn -> fn
-		{ symTab = SymTab.insert name loc (symTab fn)
-		, names  = names'
-		}
+		allocRef <- unique
+		let allocLocal = local typ allocRef
+		let alloc = LL.Alloca typ Nothing 0 []
 
-	alloca ref i32
-	store loc =<< expr e
-		
-stmt (Set _ name e) = do
-	fn <- getCurFn
-	case SymTab.lookup name (symTab fn) of
-		Just loc -> store loc =<< expr e
-		Nothing  -> error $ name ++ " doesn't exist"
+		instr $ allocRef LL.:= alloc 
+		instr $ LL.Do $ LL.Store False allocLocal val Nothing 0 []
 
-stmt (Block stmts) = do
-	modifyCurFn $ \fn -> fn { symTab = SymTab.push (symTab fn) }
-	mapM_ stmt stmts
-	modifyCurFn $ \fn -> fn { symTab = SymTab.pop (symTab fn) }
+		let (name', names') = uniqueName name (names fn)
+		modifyCurFn $ \f -> f { symTab = SymTab.insert name allocLocal (symTab f), names = names' }
+		return ()
 
-stmt (S.Set _ name e) = do
-	l <- lookupName name
-	case l of
-		Just op -> store op =<< expr e
-		Nothing -> error $ name ++ " does not exist"
+	(Print pos [e]) -> do
+		val <- expr e
+		case typeOf val of
+			LL.IntegerType nb -> printf "%d\n" [val]
 
+		return ()
 
+			
 expr :: Expr -> Cmp LL.Operand
-expr (S.Int pos n) =
-	return $ LL.ConstantOperand (LL.Int 32 $ toInteger n)
+expr e = case e of
+	S.Int pos n -> return $ cons (LLC.Int 32 $ toInteger n)
 
-expr (S.Ident pos name) = do
-	l <- lookupName name
-	case l of
-		Just op -> load op
-		Nothing -> error $ name ++ " does not exist"
+	S.Ident pos name -> do
+		fn <- getCurFn
+		op <- case SymTab.lookup name (symTab fn) of
+			Just x  -> return x
+			Nothing -> error $ name ++ " doesn't exist"
 
---expr (S.Func _ args blk) = do
---	curFn <- gets currentFn
---	un <- unique
---	fn <- getCurFn
---
---	putCurFn $ fn
---		{ currentFn = 
---
---
---
---	modify $ \s -> s { currentFn = curFn }
-	
+		ref <- unique
+		instr $ ref LL.:= LL.Load False op Nothing 0 []
+		return $ local (typeOf op) ref
 
 
+str :: String -> Cmp LL.Operand
+str s = do
+	let chars     = map (LLC.Int 8 . toInteger . ord) (s ++ "\0")
+	let strArr    = LLC.Array LL.i8 chars
+	let strArrTyp = typeOf (cons strArr)
 
--- LL Instruction wrappers
-instr :: LL.Instruction -> Cmp LL.Operand
-instr ins = do
+	consName <- addConstant "str" strArr
+	let consRef = global (LL.ptr strArrTyp) consName
+	return $ cons $ LLC.BitCast (LLC.GetElementPtr False consRef []) (LL.ptr LL.i8)
+
+
+puts :: String -> Cmp LL.Operand
+puts s = do
+	let putsTyp = LL.FunctionType LL.i32 [LL.ptr LL.i8] False
+	let puts    = cons $ global (LL.ptr putsTyp) (LL.mkName "puts")
+
+	arg <- str s
 	ref <- unique
-	refInstr ref ins
+	instr $ ref LL.:= LL.Call Nothing LL.C [] (Right puts) [(arg, [])] [] []
+	return (local LL.i32 ref)
 
 
-refInstr :: LL.Name -> LL.Instruction -> Cmp LL.Operand
-refInstr ref ins = do
-	blk <- getCurBlock
-	putCurBlock $ blk { stack = (ref LL.:= ins) : (stack blk) }
-	return $ local i32 ref
+printf :: String -> [LL.Operand] -> Cmp LL.Operand
+printf fmt args = do
+	let printfTyp = LL.FunctionType LL.i32 [LL.ptr LL.i8] True
+	let printf    = cons $ global (LL.ptr printfTyp) (LL.mkName "printf")
 
-
-doInstr :: LL.Instruction -> Cmp ()
-doInstr ins = do
-	blk <- getCurBlock
-	putCurBlock $ blk { stack = (LL.Do ins) : (stack blk) }
-
-
-i32 :: LL.Type
-i32 = LL.i32
-
-
-local :: LL.Type -> LL.Name -> LL.Operand
-local typ ref = LL.LocalReference typ ref
-
-
-externf :: LL.Name -> LL.Operand
-externf = LL.ConstantOperand . LL.GlobalReference i32
-
-
-alloca :: LL.Name -> LL.Type -> Cmp LL.Operand
-alloca ref typ = refInstr ref $ LL.Alloca typ Nothing 0 []
-
-
-store :: LL.Operand -> LL.Operand -> Cmp ()
-store ptr val = doInstr $ LL.Store False ptr val Nothing 0 []
-
-
-load :: LL.Operand -> Cmp LL.Operand
-load ptr = instr $ LL.Load False ptr Nothing 0 []
-
-
-call :: LL.Operand -> [LL.Operand] -> Cmp LL.Operand
-call fn args = instr $ LL.Call Nothing LL.C [] (Right fn) (map (\x -> (x, [])) args) [] []
+	fmtArg <- str fmt
+	ref <- unique
+	let printfArgs = map (\arg -> (arg, [])) (fmtArg : args)
+	instr $ ref LL.:= LL.Call Nothing LL.C [] (Right printf) printfArgs [] []
+	return (local LL.i32 ref)
