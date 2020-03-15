@@ -116,6 +116,19 @@ getCurFn = do
 	return $ (Map.!) fns name 
 
 
+newFn :: Cmp LL.Name
+newFn = do
+	LL.Name curFnName <- gets curFn
+
+	fn <- getCurFn
+	let (name', names') = uniqueName "func" (names fn)
+	modifyCurFn $ \f -> f { names = names' }
+
+	let fnName = LL.mkName $ (BS.unpack $ BSS.fromShort curFnName) ++ "." ++ name'
+	modify $ \s -> s { funcs = Map.insert fnName initFnState (funcs s) } 
+	return fnName
+
+
 modifyCurFn :: (FnState -> FnState) -> Cmp ()
 modifyCurFn f = do
 	name <- gets curFn
@@ -180,14 +193,15 @@ instr ins =
 
 
 typeOf :: LL.Operand -> LL.Type
-typeOf (LL.ConstantOperand (LLC.Int 32 _))  = LL.i32
-typeOf (LL.ConstantOperand (LLC.Array t a)) = LL.ArrayType (fromIntegral $ length a) t
-typeOf (LL.LocalReference t _)              = t
+typeOf (LL.ConstantOperand (LLC.Int 32 _))            = LL.i32
+typeOf (LL.ConstantOperand (LLC.Array t a))           = LL.ArrayType (fromIntegral $ length a) t
+typeOf (LL.LocalReference t _)                        = t
+typeOf (LL.ConstantOperand (LLC.GlobalReference t _)) = t
 
 
 stmt :: Stmt -> Cmp ()
 stmt s = case s of
-	(Assign pos name ex) -> do
+	Assign pos name ex -> do
 		fn <- getCurFn
 		case SymTab.lookup name [(head $ symTab fn)] of
 			Just _  -> error $ name ++ " already defined"
@@ -207,12 +221,22 @@ stmt s = case s of
 		modifyCurFn $ \f -> f { symTab = SymTab.insert name allocLocal (symTab f), names = names' }
 		return ()
 
-	(Print pos [e]) -> do
+	Print pos [e] -> do
 		val <- expr e
 		case typeOf val of
 			LL.IntegerType nb -> printf "%d\n" [val]
 
 		return ()
+
+	ExprStmt (Call pos e []) -> do
+		val <- expr e
+		instr $ LL.Do $ LL.Call Nothing LL.C [] (Right val) [] [] []
+		return ()
+
+
+	Block stmts -> mapM_ stmt stmts
+
+	
 
 			
 expr :: Expr -> Cmp LL.Operand
@@ -228,6 +252,21 @@ expr e = case e of
 		ref <- unique
 		instr $ ref LL.:= LL.Load False op Nothing 0 []
 		return $ local (typeOf op) ref
+
+	S.Func pos [] blk -> do
+		curFnName <- gets curFn
+		newFnName <- newFn
+		modify $ \s -> s { curFn = newFnName }
+		stmt blk
+		setTerminator $ LL.Do (LL.Ret Nothing [])
+
+		modify $ \s -> s { curFn = curFnName }
+
+		let fnType = LL.FunctionType LL.void [] False
+		return $ cons $ global (LL.ptr fnType) newFnName
+
+		
+		
 
 
 str :: String -> Cmp LL.Operand

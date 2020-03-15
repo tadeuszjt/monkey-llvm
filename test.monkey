@@ -1,3 +1,7 @@
 let x = 4;
-let y = x;
-print(x);
+
+let y = fn() {
+	print(2);
+};
+
+y();
